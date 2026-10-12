@@ -1,9 +1,9 @@
-name: Run Daily Lead Scraper
+name: Run Daily Voice AI Lead Harvester
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 4 * * *'
+    - cron: '0 4 * * *' # Runs daily at 04:00 UTC
 
 jobs:
   run-scraper:
@@ -23,7 +23,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute Lead Scraper
+      - name: Verify GitHub Secrets Configuration
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: |
+          if [ -z "$GCP_SA_KEY" ]; then
+            echo "::error::Missing secret 'GCP_SA_KEY'. Please add it in GitHub: Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          if [ -z "$SPREADSHEET_ID" ]; then
+            echo "::error::Missing secret 'SPREADSHEET_ID'. Please add it in GitHub: Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "GitHub Secrets sanity check passed."
+
+      - name: Execute Voice AI Lead Harvester
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
