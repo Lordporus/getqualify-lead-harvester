@@ -14,7 +14,10 @@ import re
 import urllib.parse
 from typing import Any
 
-from bs4 import BeautifulSoup
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -187,20 +190,27 @@ def extract_emails_from_html(html: str, domain: str = "") -> list[str]:
     target_domain = _normalize_domain(domain)
     found_emails: set[str] = set()
 
-    # 1. Parse mailto links via BeautifulSoup
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        for anchor in soup.find_all("a", href=True):
-            href = anchor["href"].strip()
-            if href.lower().startswith("mailto:"):
-                # Handle potential comma-separated addresses
-                raw_target = href[7:].split("?")[0]
-                for chunk in raw_target.split(","):
-                    cleaned = clean_email(chunk)
-                    if cleaned:
-                        found_emails.add(cleaned)
-    except Exception as exc:
-        logger.debug("Failed parsing soup mailto: %s", exc)
+    # 1. Parse mailto links via BeautifulSoup or regex
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for anchor in soup.find_all("a", href=True):
+                href = anchor["href"].strip()
+                if href.lower().startswith("mailto:"):
+                    raw_target = href[7:].split("?")[0]
+                    for chunk in raw_target.split(","):
+                        cleaned = clean_email(chunk)
+                        if cleaned:
+                            found_emails.add(cleaned)
+        except Exception as exc:
+            logger.debug("Failed parsing soup mailto: %s", exc)
+    else:
+        for match in re.findall(r'href=["\']mailto:([^"\'?]+)', html, re.IGNORECASE):
+            for chunk in match.split(","):
+                cleaned = clean_email(chunk)
+                if cleaned:
+                    found_emails.add(cleaned)
+
 
     # 2. Run regex pattern over full HTML text
     raw_pattern = re.compile(r"\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\b")
@@ -262,27 +272,30 @@ def extract_owner_name_from_html(html: str) -> str:
     if not html or not isinstance(html, str):
         return "N/A"
 
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        # Check team cards / role containers in DOM
-        role_text_pattern = re.compile(
-            r"\b(?:Owner|Founder|Co-Founder|President|Managing Partner|Practice Manager|Lead Attorney|Principal|Master Plumber)\b",
-            re.IGNORECASE,
-        )
-        for role_str in soup.find_all(string=role_text_pattern):
-            container = role_str.find_parent(["div", "section", "article", "li"])
-            if container:
-                for elem in container.find_all(["h1", "h2", "h3", "h4", "h5", "strong", "b"]):
-                    cand = elem.get_text(strip=True)
-                    if _is_valid_person_name(cand):
-                        return cand
+    clean_text = html
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            # Check team cards / role containers in DOM
+            role_text_pattern = re.compile(
+                r"\b(?:Owner|Founder|Co-Founder|President|Managing Partner|Practice Manager|Lead Attorney|Principal|Master Plumber)\b",
+                re.IGNORECASE,
+            )
+            for role_str in soup.find_all(string=role_text_pattern):
+                container = role_str.find_parent(["div", "section", "article", "li"])
+                if container:
+                    for elem in container.find_all(["h1", "h2", "h3", "h4", "h5", "strong", "b"]):
+                        cand = elem.get_text(strip=True)
+                        if _is_valid_person_name(cand):
+                            return cand
 
-        # Remove noisy tags for clean text parsing
-        for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
-            tag.decompose()
-        clean_text = soup.get_text(separator=" ", strip=True)
-    except Exception:
-        clean_text = html
+            # Remove noisy tags for clean text parsing
+            for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
+                tag.decompose()
+            clean_text = soup.get_text(separator=" ", strip=True)
+        except Exception:
+            clean_text = html
+
 
     # Pattern 1: Medical / Dental Dr. Title
     dr_pattern = re.compile(
