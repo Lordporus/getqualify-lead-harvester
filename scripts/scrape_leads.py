@@ -1,14 +1,44 @@
-import os
-import json
-import base64
-import re
-import traceback
-from datetime import datetime, timezone
-import requests
-import gspread
-from google.oauth2.service_account import Credentials
+"""Voice AI B2B Lead Harvester Pipeline.
 
-# Outreach-ready Google Sheet Columns
+Main entry point for discovering high-call-volume local businesses, enriching
+verified email & owner contact information, generating niche-specific Voice AI
+pitches, and synchronizing deduplicated lead records to Google Sheets.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from datetime import datetime, timezone
+import json
+import logging
+import os
+import re
+import sys
+import traceback
+import urllib.parse
+from typing import Any, List, Optional, Set, Tuple
+
+# Ensure repository root is on sys.path for direct script execution
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+import requests
+
+try:
+    from scripts.b2b_discovery import fetch_niche_businesses, normalize_phone
+    from scripts.enrichment import _normalize_domain, enrich_business_contact
+    from scripts.hooks import generate_voice_ai_hook, normalize_niche
+except ImportError:
+    from b2b_discovery import fetch_niche_businesses, normalize_phone
+    from enrichment import _normalize_domain, enrich_business_contact
+    from hooks import generate_voice_ai_hook, normalize_niche
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# Outreach-ready Google Sheet Columns (13-Column Target Schema)
 SHEET_HEADERS = [
     "Platform",
     "Name / Username",
@@ -22,126 +52,361 @@ SHEET_HEADERS = [
     "Pain Point / Snippet",
     "Recommended Outreach Hook",
     "Date Captured",
-    "Outreach Status"
+    "Outreach Status",
 ]
 
-EMAIL_REGEX = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+')
-PHONE_REGEX = re.compile(r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}')
-URL_REGEX = re.compile(r'https?://(?:www\.)?([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)(/[^\s)\]]*)?')
+# High-Intent Target Niches for Voice AI Agents
+DEFAULT_NICHES = [
+    "dental",
+    "medical",
+    "hvac",
+    "legal",
+    "autorepair",
+]
 
-def extract_contact_info(text: str) -> dict:
-    """Extract email, phone, and external website from text."""
-    emails = EMAIL_REGEX.findall(text)
-    phones = PHONE_REGEX.findall(text)
-    
-    # Filter valid phone candidates (minimum 10 digits)
-    valid_phones = [p.strip() for p in phones if len(re.sub(r'\D', '', p)) >= 10]
-    
-    urls = URL_REGEX.findall(text)
-    excluded_domains = {
-        'reddit.com', 'redd.it', 'twitter.com', 'x.com', 'github.com', 
-        'youtube.com', 'ycombinator.com', 'google.com', 't.co', 'preview.redd.it'
-    }
-    external_websites = []
-    for domain, path in urls:
-        if domain.lower() not in excluded_domains:
-            full_url = f"https://{domain}{path}"
-            external_websites.append(full_url)
-            
-    return {
-        "email": emails[0] if emails else "N/A",
-        "phone": valid_phones[0] if valid_phones else "N/A",
-        "website": external_websites[0] if external_websites else "N/A"
-    }
+# High-Volume US Metro Areas
+DEFAULT_METRO_CITIES = [
+    "Austin",
+    "Dallas",
+    "Miami",
+    "Phoenix",
+    "Atlanta",
+]
 
-def extract_business_name(title: str, text: str, author: str) -> str:
-    """Heuristic extraction of company or agency name."""
-    combined = f"{title} {text}"
-    patterns = [
-        r'(?:our company|my company|our agency|my agency|our business|my startup|at)\s+([A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+)?)',
-        r'(?:we run|we build|founder of|co-founder of|CEO of)\s+([A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+)?)',
-        r'company named\s+([A-Z][A-Za-z0-9]+)'
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, combined, re.IGNORECASE)
-        if match:
-            cand = match.group(1).strip()
-            if cand.lower() not in {"reddit", "vapi", "bland", "retell", "the", "a", "an", "our", "my", "ai"}:
-                return cand
-    return "N/A"
+CITY_STATE_MAP = {
+    "Austin": "Austin, TX",
+    "Dallas": "Dallas, TX",
+    "Miami": "Miami, FL",
+    "Phoenix": "Phoenix, AZ",
+    "Atlanta": "Atlanta, GA",
+    "Houston": "Houston, TX",
+    "Chicago": "Chicago, IL",
+    "Denver": "Denver, CO",
+    "Seattle": "Seattle, WA",
+}
 
-def classify_lead_intent(title: str, text: str) -> tuple[str, str]:
-    """Classifies the buyer intent and suggests a customized outreach hook."""
-    combined = (f"{title} {text}").lower()
-    
-    if any(k in combined for k in ["alternative", "switch", "replace", "vs", "better than", "moved away from", "leaving"]):
-        return (
-            "Seeking Alternative",
-            "Pitch voice agent platform directly against their current tool (highlight sub-800ms latency, 99.9% uptime & 30-50% lower per-minute costs)."
-        )
-    elif any(k in combined for k in ["pricing", "price", "cost", "expensive", "credit", "bill", "rates", "per minute", "overcharge"]):
-        return (
-            "Pricing / Cost Concern",
-            "Offer transparent per-minute pricing or volume discounts to dramatically slash their current voice AI bill."
-        )
-    elif any(k in combined for k in ["hire", "agency", "build for", "contractor", "freelancer", "looking for someone to build", "quote"]):
-        return (
-            "Agency / Custom Build Request",
-            "High-intent inbound request. Propose turnkey AI phone agent agency build with quick 3-day demo deployment."
-        )
-    elif any(k in combined for k in ["self-host", "self host", "open source", "local", "livekit", "asterisk", "freeswitch"]):
-        return (
-            "Self-Hosted / Tech Stack",
-            "Present developer-friendly voice infrastructure or managed enterprise alternative to eliminate maintenance overhead."
-        )
+
+def normalize_phone_key(phone: Optional[str]) -> str:
+    """Extract standard 10-digit phone key for deduplication.
+
+    Returns the last 10 digits to unify numbers with or without country code.
+    Returns empty string if invalid or N/A.
+    """
+    if not phone or not isinstance(phone, str):
+        return ""
+    cleaned = phone.strip()
+    if cleaned.lower() in ("n/a", "none", "null", "undefined"):
+        return ""
+    digits = re.sub(r"\D", "", cleaned)
+    if len(digits) >= 10:
+        return digits[-10:]
+    return digits
+
+
+def normalize_url_key(url: Optional[str]) -> str:
+    """Extract canonical bare domain from URL for deduplication.
+
+    Normalizes 'https://www.example.com/about' -> 'example.com'.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    cleaned = url.strip()
+    if cleaned.lower() in ("n/a", "none", "null", "undefined"):
+        return ""
+    domain = _normalize_domain(cleaned)
+    return domain.lower()
+
+
+def build_lead_row(
+    business: dict[str, str],
+    enrichment: dict[str, Any],
+    niche: str,
+    city: str,
+) -> list[str]:
+    """Constructs a 13-column Google Sheet lead row for outreach."""
+    biz_name = (business.get("business_name") or "").strip()
+    phone = (business.get("phone") or "N/A").strip()
+    website = (business.get("website") or "N/A").strip()
+    category = business.get("category")
+    if not category:
+        if niche.lower() == "hvac":
+            category = "HVAC Services"
+        elif niche.lower() == "autorepair":
+            category = "Auto Repair"
+        else:
+            category = niche.title()
+
+    owner = (enrichment.get("owner_name") or "").strip()
+    if not owner or owner.upper() == "N/A":
+        lead_name = "Practice / Business Manager"
     else:
-        return (
-            "General Voice AI Interest",
-            "Reach out asking about their current call handling bottlenecks and offer an interactive live demo phone call."
-        )
+        lead_name = owner
+
+    raw_email = (enrichment.get("email") or "N/A").strip()
+    email = raw_email if raw_email else "N/A"
+    has_after_hours = bool(enrichment.get("has_after_hours_notice", False))
+
+    lead_type, pain_point, hook = generate_voice_ai_hook(
+        niche=niche,
+        business_name=biz_name,
+        city=city,
+        owner_name=owner if owner.upper() != "N/A" else "",
+        has_after_hours_notice=has_after_hours,
+    )
+
+    clean_city = city.strip().title()
+    loc_display = CITY_STATE_MAP.get(clean_city, clean_city)
+    title_subject = f"{category} - {loc_display}"
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    return [
+        "B2B Directory / Web",        # 1. Platform
+        lead_name,                    # 2. Name / Username
+        biz_name,                     # 3. Business / Company
+        email,                        # 4. Email
+        phone,                        # 5. Phone Number
+        website,                      # 6. Website URL
+        website,                      # 7. Post / Source URL
+        title_subject,                # 8. Title / Subject
+        lead_type,                    # 9. Lead Type / Intent
+        pain_point,                   # 10. Pain Point / Snippet
+        hook,                         # 11. Recommended Outreach Hook
+        now_str,                      # 12. Date Captured
+        "Ready for Outreach",         # 13. Outreach Status
+    ]
+
+
+def extract_existing_keys(existing_records: list[list[str]]) -> tuple[set[str], set[str]]:
+    """Extracts existing phone numbers and website domains from Google Sheet rows for deduplication."""
+    existing_phones: set[str] = set()
+    existing_websites: set[str] = set()
+
+    if not existing_records or len(existing_records) <= 1:
+        return existing_phones, existing_websites
+
+    header_row = [str(h).strip().lower() for h in existing_records[0]]
+
+    # Detect phone column index
+    phone_idx = None
+    for idx, h in enumerate(header_row):
+        if "phone" in h:
+            phone_idx = idx
+            break
+    if phone_idx is None:
+        phone_idx = 4  # Default Col 5 (0-indexed: 4)
+
+    # Detect website column indices
+    website_indices: list[int] = []
+    for idx, h in enumerate(header_row):
+        if "website" in h or "post / source" in h or "url" in h:
+            website_indices.append(idx)
+    if not website_indices:
+        website_indices = [5, 6]  # Default Col 6, Col 7
+
+    for row in existing_records[1:]:
+        if len(row) > phone_idx and row[phone_idx]:
+            p_key = normalize_phone_key(row[phone_idx])
+            if p_key:
+                existing_phones.add(p_key)
+
+        for w_idx in website_indices:
+            if len(row) > w_idx and row[w_idx]:
+                w_key = normalize_url_key(row[w_idx])
+                if w_key:
+                    existing_websites.add(w_key)
+
+    return existing_phones, existing_websites
+
+
+def scrape_leads(
+    limit: int = 15,
+    niches: Optional[list[str]] = None,
+    cities: Optional[list[str]] = None,
+    existing_phones: Optional[set[str]] = None,
+    existing_websites: Optional[set[str]] = None,
+    dry_run: bool = False,
+) -> list[list[str]]:
+    """Discovers, enriches, and formats B2B Voice AI leads across niches and cities.
+
+    Args:
+        limit: Total number of fresh leads to harvest.
+        niches: List of target business niches. Defaults to DEFAULT_NICHES.
+        cities: List of target metro cities. Defaults to DEFAULT_METRO_CITIES.
+        existing_phones: Set of existing phone keys to skip (from Google Sheet).
+        existing_websites: Set of existing website keys to skip (from Google Sheet).
+        dry_run: Flag indicating local dry-run execution.
+
+    Returns:
+        List of 13-column lead rows ready for Google Sheet outreach.
+    """
+    target_niches = niches or DEFAULT_NICHES
+    target_cities = cities or DEFAULT_METRO_CITIES
+
+    seen_phones: set[str] = set(existing_phones or set())
+    seen_websites: set[str] = set(existing_websites or set())
+
+    harvested_leads: list[list[str]] = []
+
+    # Build rotating (niche, city) execution schedule
+    rotation_pairs: list[tuple[str, str]] = []
+    for c_offset in range(len(target_cities)):
+        for n_idx, niche in enumerate(target_niches):
+            city = target_cities[(c_offset + n_idx) % len(target_cities)]
+            pair = (niche, city)
+            if pair not in rotation_pairs:
+                rotation_pairs.append(pair)
+
+    logger.info(
+        "Beginning B2B lead harvest. Target: %d leads across %d niche-city combinations.",
+        limit,
+        len(rotation_pairs),
+    )
+
+    per_niche_target = (
+        max(1, limit // len(target_niches)) if len(target_niches) > 1 else limit
+    )
+    niche_counts: dict[str, int] = {n: 0 for n in target_niches}
+
+    for pass_idx in (1, 2):
+        if len(harvested_leads) >= limit:
+            break
+
+        for niche, city in rotation_pairs:
+            if len(harvested_leads) >= limit:
+                break
+
+            if pass_idx == 1 and niche_counts[niche] >= per_niche_target:
+                continue
+
+            needed = limit - len(harvested_leads)
+            fetch_limit = min(max(needed + 2, 5), 15)
+
+            logger.info(
+                "Searching niche '%s' in city '%s' (batch fetch limit: %d, pass: %d)...",
+                niche,
+                city,
+                fetch_limit,
+                pass_idx,
+            )
+
+            try:
+                candidates = fetch_niche_businesses(niche, city, limit=fetch_limit)
+            except Exception as exc:
+                logger.warning("Error fetching businesses for %s in %s: %s", niche, city, exc)
+                continue
+
+            for cand in candidates:
+                if len(harvested_leads) >= limit:
+                    break
+
+                biz_name = cand.get("business_name", "")
+                phone = cand.get("phone", "")
+                website = cand.get("website", "")
+
+                p_key = normalize_phone_key(phone)
+                w_key = normalize_url_key(website)
+
+                # Deduplication checks
+                if p_key and p_key in seen_phones:
+                    logger.debug("Skipping duplicate phone: %s (%s)", phone, biz_name)
+                    continue
+
+                if w_key and w_key in seen_websites:
+                    logger.debug("Skipping duplicate website: %s (%s)", website, biz_name)
+                    continue
+
+                # Enrich contact details (email, owner name, after-hours notice)
+                enrichment_timeout = 4 if dry_run else 5
+                try:
+                    enrichment = enrich_business_contact(website, timeout=enrichment_timeout)
+                except Exception as exc:
+                    logger.debug("Enrichment error for %s: %s", website, exc)
+                    enrichment = {"email": "N/A", "owner_name": "N/A", "has_after_hours_notice": False}
+
+                # Build full 13-column outreach row
+                lead_row = build_lead_row(
+                    business=cand,
+                    enrichment=enrichment,
+                    niche=niche,
+                    city=city,
+                )
+
+                # Mark as seen
+                if p_key:
+                    seen_phones.add(p_key)
+                if w_key:
+                    seen_websites.add(w_key)
+
+                harvested_leads.append(lead_row)
+                niche_counts[niche] += 1
+
+                logger.info(
+                    "[%d/%d] Harvested: %s (%s) | Phone: %s | Email: %s",
+                    len(harvested_leads),
+                    limit,
+                    biz_name,
+                    niche,
+                    phone,
+                    lead_row[3],
+                )
+
+                if pass_idx == 1 and niche_counts[niche] >= per_niche_target:
+                    break
+
+    logger.info("Harvest completed. Total fresh leads collected: %d", len(harvested_leads))
+    return harvested_leads
+
 
 def get_sheet():
     """Authenticates with Google Sheets using GCP_SA_KEY and SPREADSHEET_ID."""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError as err:
+        raise ImportError(
+            "gspread and google-auth are required to connect to Google Sheets. "
+            "Please run: pip install gspread google-auth"
+        ) from err
+
     sa_json = os.environ.get("GCP_SA_KEY", "")
     sheet_id = os.environ.get("SPREADSHEET_ID", "")
 
     if not sa_json or not sa_json.strip():
         raise ValueError(
-            "GCP_SA_KEY secret is missing or empty in GitHub Actions. "
-            "Please go to Repository Settings -> Secrets and variables -> Actions, and add GCP_SA_KEY."
+            "GCP_SA_KEY secret is missing or empty. "
+            "Please configure GCP_SA_KEY in your environment or GitHub Secrets."
         )
     if not sheet_id or not sheet_id.strip():
         raise ValueError(
-            "SPREADSHEET_ID secret is missing or empty in GitHub Actions. "
-            "Please go to Repository Settings -> Secrets and variables -> Actions, and add SPREADSHEET_ID."
+            "SPREADSHEET_ID secret is missing or empty. "
+            "Please configure SPREADSHEET_ID in your environment or GitHub Secrets."
         )
 
     sa_json = sa_json.strip()
     sheet_id = sheet_id.strip()
 
-    # Unwrap potential enclosing quotes
-    if (sa_json.startswith('"') and sa_json.endswith('"')) or (sa_json.startswith("'") and sa_json.endswith("'")):
+    if (sa_json.startswith('"') and sa_json.endswith('"')) or (
+        sa_json.startswith("'") and sa_json.endswith("'")
+    ):
         sa_json = sa_json[1:-1].strip()
 
     sa_info = None
-    # 1. Try direct JSON parsing
     try:
         sa_info = json.loads(sa_json)
-        print("Successfully parsed GCP_SA_KEY as raw JSON.", flush=True)
+        logger.info("Successfully parsed GCP_SA_KEY as raw JSON.")
     except json.JSONDecodeError as direct_err:
-        # 2. Try Base64 decoding fallback
         try:
             decoded_bytes = base64.b64decode(sa_json)
             decoded_str = decoded_bytes.decode("utf-8")
             sa_info = json.loads(decoded_str)
-            print("Successfully decoded and parsed GCP_SA_KEY from Base64.", flush=True)
+            logger.info("Successfully decoded and parsed GCP_SA_KEY from Base64.")
         except Exception:
             preview = sa_json[:20] + "..." if len(sa_json) > 20 else sa_json
             raise ValueError(
                 f"GCP_SA_KEY is neither valid JSON nor valid Base64 JSON.\n"
                 f"Received length={len(sa_json)} characters. Preview='{preview}'.\n"
-                f"JSON Error: {direct_err}.\n"
-                f"Please ensure you copied the entire contents of your Google Cloud Service Account JSON key."
+                f"JSON Error: {direct_err}."
             ) from direct_err
 
     scope = [
@@ -153,132 +418,68 @@ def get_sheet():
     client = gspread.authorize(creds)
     return client.open_by_key(sheet_id).sheet1
 
-def scrape_reddit_leads() -> list[list]:
-    """Scrapes voice AI leads from Reddit search API."""
-    leads = []
-    queries = [
-        'Vapi alternative',
-        'Bland AI pricing',
-        'Bland AI alternative',
-        'Retell AI alternative',
-        'AI phone agent agency',
-        'AI receptionist cost',
-        'AI cold calling agent',
-        'voice agent self hosted',
-        'AI receptionist for small business'
-    ]
-
-    headers = {"User-Agent": "web:getqualify-voiceai-harvester:v2.0 (by /u/voiceleadbot)"}
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    for q in queries:
-        url = f"https://www.reddit.com/search.json?q={requests.utils.quote(q)}&sort=new&limit=15"
-        print(f"[Reddit] Searching: '{q}'", flush=True)
-        try:
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                for post in data.get("data", {}).get("children", []):
-                    p = post.get("data", {})
-                    if p.get("stickied") or p.get("over_18"):
-                        continue
-                    
-                    author = p.get("author", "N/A")
-                    title = p.get("title", "").strip()
-                    permalink = p.get("permalink", "")
-                    post_url = f"https://reddit.com{permalink}" if permalink else ""
-                    selftext = p.get("selftext", "")
-                    clean_snippet = selftext[:400].replace("\n", " ").strip()
-                    if not clean_snippet:
-                        clean_snippet = title
-
-                    # Enrich lead details
-                    contact_info = extract_contact_info(f"{title} {selftext}")
-                    business_name = extract_business_name(title, selftext, author)
-                    lead_type, outreach_hook = classify_lead_intent(title, clean_snippet)
-
-                    leads.append([
-                        "Reddit",
-                        author,
-                        business_name,
-                        contact_info["email"],
-                        contact_info["phone"],
-                        contact_info["website"],
-                        post_url,
-                        title,
-                        lead_type,
-                        clean_snippet,
-                        outreach_hook,
-                        now_str,
-                        "Ready for Outreach"
-                    ])
-            else:
-                print(f"[Reddit] Query '{q}' returned HTTP status {r.status_code}", flush=True)
-        except Exception as e:
-            print(f"[Reddit] Error fetching '{q}': {e}", flush=True)
-
-    return leads
-
-def scrape_hackernews_leads() -> list[list]:
-    """Scrapes tech founder and business leads from HackerNews discussions (Algolia API)."""
-    leads = []
-    queries = [
-        'Vapi AI',
-        'Bland AI',
-        'Retell AI',
-        'AI voice agent',
-        'AI phone receptionist'
-    ]
-
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    for q in queries:
-        url = f"https://hn.algolia.com/api/v1/search_by_date?query={requests.utils.quote(q)}&tags=(story,comment)&hitsPerPage=10"
-        print(f"[HackerNews] Searching: '{q}'", flush=True)
-        try:
-            r = requests.get(url, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                for hit in data.get("hits", []):
-                    author = hit.get("author", "N/A")
-                    story_title = hit.get("story_title") or hit.get("title") or f"Discussion on {q}"
-                    comment_text = hit.get("comment_text") or hit.get("story_text") or ""
-                    
-                    # Clean HTML tags from HN snippets
-                    clean_text = re.sub(r'<[^>]+>', ' ', comment_text)[:400].replace("\n", " ").strip()
-                    if not clean_text:
-                        clean_text = story_title
-
-                    # Post URL
-                    object_id = hit.get("objectID", "")
-                    post_url = f"https://news.ycombinator.com/item?id={object_id}" if object_id else hit.get("url", "")
-
-                    contact_info = extract_contact_info(f"{story_title} {clean_text}")
-                    business_name = extract_business_name(story_title, clean_text, author)
-                    lead_type, outreach_hook = classify_lead_intent(story_title, clean_text)
-
-                    leads.append([
-                        "HackerNews / Web",
-                        author,
-                        business_name,
-                        contact_info["email"],
-                        contact_info["phone"],
-                        contact_info["website"],
-                        post_url,
-                        story_title,
-                        lead_type,
-                        clean_text,
-                        outreach_hook,
-                        now_str,
-                        "Ready for Outreach"
-                    ])
-        except Exception as e:
-            print(f"[HackerNews] Error fetching '{q}': {e}", flush=True)
-
-    return leads
 
 def main():
+    """Main CLI entry point for Voice AI Lead Harvester."""
+    parser = argparse.ArgumentParser(
+        description="Voice AI B2B Lead Harvester - High-call volume business discovery and outreach generator."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run discovery and enrichment locally without connecting to or updating Google Sheets.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=15,
+        help="Total number of fresh leads to harvest (default: 15).",
+    )
+    parser.add_argument(
+        "--niches",
+        nargs="*",
+        default=None,
+        help="Specific niches to target (e.g. --niches dental hvac legal).",
+    )
+    parser.add_argument(
+        "--cities",
+        nargs="*",
+        default=None,
+        help="Specific metro cities to target (e.g. --cities Austin Dallas Miami).",
+    )
+    args = parser.parse_args()
+
     try:
+        if args.dry_run:
+            print("=== Starting Voice AI Lead Harvester (DRY RUN) ===", flush=True)
+            leads = scrape_leads(
+                limit=args.limit,
+                niches=args.niches,
+                cities=args.cities,
+                dry_run=True,
+            )
+
+            print(
+                f"\n[DRY RUN COMPLETE] Harvested {len(leads)} high-quality B2B leads:\n",
+                flush=True,
+            )
+            for idx, lead in enumerate(leads, start=1):
+                print(f"--- Lead #{idx} ---")
+                print(f"Company:       {lead[2]}")
+                print(f"Contact Name:  {lead[1]}")
+                print(f"Phone Number:  {lead[4]}")
+                print(f"Website URL:   {lead[5]}")
+                print(f"Email:         {lead[3]}")
+                print(f"Title/Subject: {lead[7]}")
+                print(f"Lead Intent:   {lead[8]}")
+                print(f"Pain Point:    {lead[9]}")
+                print(f"Outreach Hook: {lead[10]}")
+                print(f"Date Captured: {lead[11]}")
+                print(f"Status:        {lead[12]}")
+                print()
+            return
+
+        # Production run with Google Sheets synchronization
         print("=== Starting Voice AI Lead Harvester ===", flush=True)
         sheet = get_sheet()
         existing_records = sheet.get_all_values()
@@ -287,77 +488,74 @@ def main():
         if not existing_records:
             print("Sheet is empty. Adding outreach-ready headers...", flush=True)
             sheet.append_row(SHEET_HEADERS)
-            existing_urls = set()
+            existing_phones, existing_websites = set(), set()
         else:
             first_row = existing_records[0]
-            # If the sheet currently has older or different headers, update row 1 to full schema
             if len(first_row) < len(SHEET_HEADERS) or first_row[0] != SHEET_HEADERS[0]:
-                print("Updating Google Sheet header row to complete outreach schema...", flush=True)
+                print(
+                    "Updating Google Sheet header row to complete outreach schema...",
+                    flush=True,
+                )
                 for col_idx, header_val in enumerate(SHEET_HEADERS, start=1):
                     sheet.update_cell(1, col_idx, header_val)
-            
-            # Index existing post URLs (column index 6 / 7th column: Post / Source URL)
-            # Support both old schema (URL at index 3) and new schema (URL at index 6)
-            existing_urls = set()
-            for row in existing_records[1:]:
-                if len(row) > 6 and row[6].startswith("http"):
-                    existing_urls.add(row[6])
-                elif len(row) > 3 and row[3].startswith("http"):
-                    existing_urls.add(row[3])
 
-        # Harvest from multi-channel engines
-        reddit_leads = scrape_reddit_leads()
-        hn_leads = scrape_hackernews_leads()
-        all_leads = reddit_leads + hn_leads
-        print(f"Total leads harvested: {len(all_leads)} (Reddit: {len(reddit_leads)}, HackerNews/Web: {len(hn_leads)})", flush=True)
+            existing_phones, existing_websites = extract_existing_keys(existing_records)
+            print(
+                f"Indexed existing records: {len(existing_phones)} phones, {len(existing_websites)} websites.",
+                flush=True,
+            )
 
-        if not all_leads:
-            print("No new leads found during this run cycle.", flush=True)
-            if len(existing_records) <= 1:
-                # Add sample verification row so user can confirm write access
-                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                sheet.append_row([
-                    "System",
-                    "VoiceBot Lead System",
-                    "GetQualify AI",
-                    "contact@getqualify.in",
-                    "+1-800-555-0199",
-                    "https://getqualify.in",
-                    "https://getqualify.in/demo",
-                    "Google Sheet Integration Verified",
-                    "System Health Check",
-                    "Verified automated write permissions for Voice AI Harvester.",
-                    "Ready for automated outreach.",
-                    now_str,
-                    "Active"
-                ])
-                print("Added verification test lead to confirm write permissions.", flush=True)
-            return
+        # Harvest fresh deduplicated leads
+        leads = scrape_leads(
+            limit=args.limit,
+            niches=args.niches,
+            cities=args.cities,
+            existing_phones=existing_phones,
+            existing_websites=existing_websites,
+            dry_run=False,
+        )
 
-        # Deduplicate based on Post / Source URL (index 6)
-        unique_rows = [row for row in all_leads if row[6] and row[6] not in existing_urls]
-        
-        # In-memory deduplication within current batch
-        seen_batch_urls = set()
-        deduped_batch = []
-        for row in unique_rows:
-            url = row[6]
-            if url not in seen_batch_urls:
-                seen_batch_urls.add(url)
-                deduped_batch.append(row)
-
-        if deduped_batch:
-            sheet.append_rows(deduped_batch)
-            print(f"Successfully added {len(deduped_batch)} fresh, outreach-ready leads to Google Sheets!", flush=True)
+        if leads:
+            sheet.append_rows(leads)
+            print(
+                f"Successfully added {len(leads)} fresh, outreach-ready leads to Google Sheets!",
+                flush=True,
+            )
         else:
-            print("All scraped leads already exist in your Google Sheet. No duplicates added.", flush=True)
+            print(
+                "No new leads found during this run cycle or all candidates already exist in the sheet.",
+                flush=True,
+            )
+            if len(existing_records) <= 1:
+                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                verification_lead = [
+                    "B2B Directory / Web",
+                    "Practice / Business Manager",
+                    "GetQualify AI Demo",
+                    "contact@getqualify.io",
+                    "+1 (800) 555-0199",
+                    "https://getqualify.io",
+                    "https://getqualify.io",
+                    "Dental Practice - Austin, TX",
+                    "Dental Practice - Inbound Patient Intake & After-Hours Receptionist",
+                    "Dental offices lose 30-40% of emergency patient inquiries after 5 PM.",
+                    "Pitch an after-hours AI voice receptionist to capture missed patient appointments 24/7.",
+                    now_str,
+                    "Ready for Outreach",
+                ]
+                sheet.append_row(verification_lead)
+                print(
+                    "Added verification test lead to confirm write permissions.",
+                    flush=True,
+                )
 
         print("=== Lead Harvesting Complete ===", flush=True)
 
-    except Exception as e:
-        print(f"FATAL ERROR in Lead Harvester: {e}", flush=True)
+    except Exception as exc:
+        print(f"FATAL ERROR in Lead Harvester: {exc}", flush=True)
         traceback.print_exc()
         raise
+
 
 if __name__ == "__main__":
     main()
