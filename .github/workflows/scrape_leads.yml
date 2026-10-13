@@ -1,12 +1,23 @@
 name: Run Daily Voice AI Lead Harvester
 
+# Automated daily execution and manual on-demand trigger for discovering high-call-volume
+# B2B businesses (dental, medical, hvac, legal, autorepair), enriching contact information,
+# generating tailored Voice AI pitch hooks, and synchronizing deduplicated leads to Google Sheets.
+
 on:
   workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Number of fresh leads to harvest'
+        required: false
+        default: '15'
+        type: string
   schedule:
     - cron: '0 4 * * *' # Runs daily at 04:00 UTC
 
 jobs:
-  run-scraper:
+  harvest-leads:
+    name: Harvest & Sync B2B Voice AI Leads
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -42,5 +53,6 @@ jobs:
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          HARVEST_LIMIT: ${{ inputs.limit || '15' }}
         run: |
-          python scripts/scrape_leads.py
+          python scripts/scrape_leads.py --limit "${HARVEST_LIMIT:-15}"
