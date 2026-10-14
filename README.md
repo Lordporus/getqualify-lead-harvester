@@ -23,14 +23,35 @@ The harvester targets businesses where missed phone calls directly equal lost re
 * **Auto Repair & Body Shops (`autorepair`):** High phone burden for repair quotes, status updates, and towing dispatch.
 
 ### Target Metro Areas
-Default target metros include high-density, growing US markets:
+The harvester cascades through 15 high-density, growing US markets:
 * **Austin, TX**
 * **Dallas, TX**
 * **Miami, FL**
 * **Phoenix, AZ**
 * **Atlanta, GA**
+* **Houston, TX**
+* **Orlando, FL**
+* **Tampa, FL**
+* **Charlotte, NC**
+* **Nashville, TN**
+* **Las Vegas, NV**
+* **Denver, CO**
+* **San Antonio, TX**
+* **Columbus, OH**
+* **Indianapolis, IN**
 
-*Additional supported metros include Houston, Chicago, Denver, Seattle, and any custom US metro configured via CLI.*
+*Additional supported metros include Chicago, Seattle, and any custom US metro configured via CLI.*
+
+---
+
+## 🛡️ Ironclad Multi-Key Deduplication Engine
+
+To ensure that your Google Sheet **never receives duplicate leads at any cost**, every candidate is vetted through a 4-point deduplication engine against both existing sheet records and in-batch candidates:
+
+1. **Normalized 10-Digit Phone Key:** Unifies international, dashed, dotted, and parenthesized numbers (e.g. `+1 (512) 555-0199` and `512.555.0199` both reduce to `5125550199`).
+2. **Canonical Bare Root Domain:** Strips protocols, subdomains, paths, and tracking queries (`https://www.austindental.com/contact?src=ad` becomes `austindental.com`).
+3. **Company + City Signature:** Normalizes company trade name and municipality (`"Apex Dental Studio, LLC"` in `"Austin, TX"` becomes `"apexdentalstudio::austin"`).
+4. **Canonical Source URL:** Protects against repeated directory or social query URLs.
 
 ---
 
@@ -40,7 +61,7 @@ Every harvested lead is structured into an actionable 13-column format ready for
 
 | # | Column Header | Description | Real Example |
 |---|---|---|---|
-| 1 | **Platform** | Source channel identifier | `B2B Directory / Web` |
+| 1 | **Platform** | Source channel identifier | `B2B Directory / Web` or `Agent-Reach / Web` |
 | 2 | **Name / Username** | Doctor, owner, or partner name (or role fallback) | `Dr. Darshan Patel` *(or `Practice / Business Manager`)* |
 | 3 | **Business / Company** | Verified company or practice trade name | `Apex Dental Studio` |
 | 4 | **Email** | Enriched business or owner email | `contact@apexdentalstudio.com` *(or `N/A`)* |
@@ -51,7 +72,7 @@ Every harvested lead is structured into an actionable 13-column format ready for
 | 9 | **Lead Type / Intent** | Voice AI operational deployment role | `Dental Practice - Inbound Patient Intake & After-Hours Receptionist` |
 | 10 | **Pain Point / Snippet** | Concrete operational call bottleneck | *"Dental practices experience high call abandonment during lunch hours and miss after-hours emergency booking inquiries, losing new patients to competitor clinics."* |
 | 11 | **Recommended Outreach Hook** | Pre-generated cold outreach pitch hook | *"Pitch an after-hours AI receptionist to Dr. Darshan Patel at Apex Dental Studio in Austin that answers patient calls 24/7, handles emergency triage, and books appointments directly into their practice calendar."* |
-| 12 | **Date Captured** | UTC timestamp of discovery | `2026-10-13 18:30:00 UTC` |
+| 12 | **Date Captured** | UTC timestamp of discovery | `2026-10-14 09:00:00 UTC` |
 | 13 | **Outreach Status** | Lead pipeline status | `Ready for Outreach` |
 
 ---
@@ -68,6 +89,7 @@ cd getqualify-lead-harvester
 
 # Install dependencies
 pip install -r requirements.txt
+pip install git+https://github.com/Panniantong/agent-reach.git || true
 ```
 
 ### 2. Dry-Run Mode (No Google Cloud Credentials Required)
@@ -76,29 +98,10 @@ Test discovery, enrichment, and pitch hook generation without writing to Google 
 python scripts/scrape_leads.py --dry-run
 ```
 
-Outputs a formatted breakdown of discovered leads in your terminal:
-```text
-=== Starting Voice AI Lead Harvester (DRY RUN) ===
-[DRY RUN COMPLETE] Harvested 5 high-quality B2B leads:
-
---- Lead #1 ---
-Company:       Apex Dental Studio
-Contact Name:  Dr. Darshan Patel
-Phone Number:  +1 (512) 441-2098
-Website URL:   https://apexdentalstudio.com
-Email:         contact@apexdentalstudio.com
-Title/Subject: Dental Clinic - Austin, TX
-Lead Intent:   Dental Practice - Inbound Patient Intake & After-Hours Receptionist
-Pain Point:    Dental offices lose 30-40% of emergency patient inquiries after 5 PM...
-Outreach Hook: Pitch an after-hours AI receptionist to Dr. Darshan Patel at Apex Dental Studio...
-Date Captured: 2026-10-13 18:30:00 UTC
-Status:        Ready for Outreach
-```
-
 ### 3. Setting Lead Limits
-Control the harvest size with `--limit` (default is 15):
+Control the harvest size with `--limit` (default is **50 leads**):
 ```bash
-python scripts/scrape_leads.py --dry-run --limit 10
+python scripts/scrape_leads.py --dry-run --limit 50
 ```
 
 ### 4. Customizing Niches & Metro Cities
@@ -111,7 +114,7 @@ python scripts/scrape_leads.py --dry-run --niches dental hvac
 python scripts/scrape_leads.py --dry-run --niches legal --cities Austin Dallas
 
 # Full custom campaign with limit
-python scripts/scrape_leads.py --dry-run --limit 20 --niches dental medical hvac --cities Austin Dallas Miami
+python scripts/scrape_leads.py --dry-run --limit 50 --niches dental medical hvac --cities Austin Dallas Miami
 ```
 
 ---
@@ -164,12 +167,12 @@ To sync to Google Sheets from your local terminal:
 # macOS / Linux
 export SPREADSHEET_ID="your_spreadsheet_id_here"
 export GCP_SA_KEY="$(cat path/to/service_account.json)"
-python scripts/scrape_leads.py --limit 15
+python scripts/scrape_leads.py --limit 50
 
 # Windows PowerShell
 $env:SPREADSHEET_ID = "your_spreadsheet_id_here"
 $env:GCP_SA_KEY = Get-Content -Raw "path\to\service_account.json"
-python scripts/scrape_leads.py --limit 15
+python scripts/scrape_leads.py --limit 50
 ```
 
 ---
@@ -178,23 +181,27 @@ python scripts/scrape_leads.py --limit 15
 
 The repository includes an automated workflow defined in [`.github/workflows/scrape_leads.yml`](.github/workflows/scrape_leads.yml):
 
-* **Daily Cron Schedule:** Runs automatically every day at **04:00 UTC** (`0 4 * * *`).
+* **Daily Cron Schedule:** Runs automatically every morning at **09:00 AM IST** (`30 3 * * *` UTC).
+* **Guaranteed 50 Leads:** Harvests and appends exactly 50 outreach-ready leads per run across 15 high-intent metro areas.
 * **Manual Dispatch:** Supports on-demand trigger with an optional `limit` parameter directly from the GitHub Actions UI (**Actions > Run Daily Voice AI Lead Harvester > Run workflow**).
-* **Automated Deduplication:** Reads existing phone numbers and website domains from the sheet before appending, guaranteeing zero duplicates across consecutive daily runs.
+* **Multi-Key Deduplication:** Ingests all historical leads from your sheet before scraping, ensuring zero duplicate phone numbers, websites, or business signatures at any cost.
+* **Rate-Limit Safe Batch Upload:** Appends all 50 leads in a single `sheet.append_rows()` API transaction to avoid hitting Google Cloud quotas.
 * **Pre-flight Credential Validation:** Verifies that both `GCP_SA_KEY` and `SPREADSHEET_ID` are present before attempting network scraping.
 
 ---
 
 ## 🧪 Testing & Verification
 
-The codebase includes comprehensive unit and integration tests across discovery, crawler enrichment, pitch hook generation, and pipeline deduplication:
+The codebase includes comprehensive unit and integration tests across discovery, deduplication, Agent-Reach adapter, crawler enrichment, pitch hook generation, and pipeline deduplication:
 
 ```bash
 # Run all tests
 python -m unittest discover tests
 
 # Run specific test modules
+python -m unittest tests/test_deduplication.py
 python -m unittest tests/test_b2b_discovery.py
+python -m unittest tests/test_agent_reach_adapter.py
 python -m unittest tests/test_enrichment.py
 python -m unittest tests/test_hooks.py
 python -m unittest tests/test_integration.py

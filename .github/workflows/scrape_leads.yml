@@ -10,10 +10,10 @@ on:
       limit:
         description: 'Number of fresh leads to harvest'
         required: false
-        default: '15'
+        default: '50'
         type: string
   schedule:
-    - cron: '0 4 * * *' # Runs daily at 04:00 UTC
+    - cron: '30 3 * * *' # Runs daily at 09:00 AM IST (03:30 UTC)
 
 jobs:
   harvest-leads:
@@ -33,6 +33,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install git+https://github.com/Panniantong/agent-reach.git || true
 
       - name: Verify GitHub Secrets Configuration
         env:
@@ -53,6 +54,6 @@ jobs:
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          HARVEST_LIMIT: ${{ inputs.limit || '15' }}
+          HARVEST_LIMIT: ${{ inputs.limit || '50' }}
         run: |
-          python scripts/scrape_leads.py --limit "${HARVEST_LIMIT:-15}"
+          python scripts/scrape_leads.py --limit "${HARVEST_LIMIT:-50}"
