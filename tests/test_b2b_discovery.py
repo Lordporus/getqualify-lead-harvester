@@ -127,6 +127,20 @@ class TestB2BDiscovery(unittest.TestCase):
                     self.assertEqual(item["phone"], "+1 (512) 555-7788")
                     self.assertEqual(item["website"], "https://www.downtownsmiledental.com")
 
+    def test_harvest_target_leads_quota(self):
+        """Test that harvest_target_leads satisfies requested target_count quota."""
+        from scripts.b2b_discovery import harvest_target_leads
+        from scripts.deduplication import LeadDeduplicator
+
+        dedup = LeadDeduplicator()
+        leads = harvest_target_leads(target_count=10, deduplicator=dedup)
+        self.assertEqual(len(leads), 10)
+
+        # Verify no internal duplicate phone numbers in the returned batch
+        phones = [l["phone"] for l in leads]
+        self.assertEqual(len(phones), len(set(phones)))
+
 
 if __name__ == "__main__":
     unittest.main()
+

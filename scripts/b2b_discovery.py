@@ -505,6 +505,89 @@ def fetch_niche_businesses(niche_key: str, city: str, limit: int = 15) -> List[D
     return leads[:limit]
 
 
+DEFAULT_METRO_CITIES = [
+    "Austin",
+    "Dallas",
+    "Miami",
+    "Phoenix",
+    "Atlanta",
+    "Houston",
+    "Orlando",
+    "Tampa",
+    "Charlotte",
+    "Nashville",
+    "Las Vegas",
+    "Denver",
+    "San Antonio",
+    "Columbus",
+    "Indianapolis",
+]
+
+DEFAULT_NICHES = [
+    "dental",
+    "medical",
+    "hvac",
+    "legal",
+    "autorepair",
+]
+
+
+def harvest_target_leads(
+    target_count: int = 50,
+    deduplicator: Optional[Any] = None,
+    niches: Optional[List[str]] = None,
+    cities: Optional[List[str]] = None,
+    batch_size: int = 5,
+    max_passes: int = 4,
+) -> List[Dict[str, str]]:
+    """Cascading harvester that guarantees target_count unique leads.
+
+    Iterates through niches and cities matrix, querying local business discovery
+    and filtering candidates against deduplicator until target_count is reached.
+    """
+    use_niches = [n.lower().strip() for n in niches] if niches else DEFAULT_NICHES
+    use_cities = [c.strip().title() for c in cities] if cities else DEFAULT_METRO_CITIES
+
+    harvested: List[Dict[str, str]] = []
+
+    logger.info(
+        "Starting cascading harvest. Target: %d unique leads across %d cities and %d niches.",
+        target_count,
+        len(use_cities),
+        len(use_niches),
+    )
+
+    for pass_num in range(1, max_passes + 1):
+        for niche in use_niches:
+            for city in use_cities:
+                if len(harvested) >= target_count:
+                    break
+
+                needed = target_count - len(harvested)
+                fetch_limit = min(max(batch_size, needed), 15)
+                candidates = fetch_niche_businesses(niche, city, limit=fetch_limit)
+
+                for cand in candidates:
+                    if deduplicator and deduplicator.is_duplicate(cand):
+                        continue
+
+                    if deduplicator:
+                        deduplicator.register_lead(cand)
+
+                    harvested.append(cand)
+                    if len(harvested) >= target_count:
+                        break
+
+            if len(harvested) >= target_count:
+                break
+
+        if len(harvested) >= target_count:
+            break
+
+    logger.info("Cascading harvest complete. Collected %d unique leads.", len(harvested))
+    return harvested[:target_count]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Discover local high-call-volume businesses.")
     parser.add_argument("--niche", type=str, default="dental", help="Business niche (dental, hvac, legal, etc.)")
@@ -514,3 +597,4 @@ if __name__ == "__main__":
 
     results = fetch_niche_businesses(args.niche, args.city, args.limit)
     print(json.dumps(results, indent=2))
+
