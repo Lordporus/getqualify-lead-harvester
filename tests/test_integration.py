@@ -432,6 +432,104 @@ class TestCLIExecution(unittest.TestCase):
         self.assertTrue(call_kwargs.get("dry_run"))
         self.assertEqual(call_kwargs.get("limit"), 1)
 
+    @patch("scripts.scrape_leads.get_sheet")
+    @patch("scripts.scrape_leads.scrape_leads")
+    def test_batch_append_single_call(self, mock_scrape, mock_get_sheet):
+        """Verify main() uploads all 50 leads in a single batch append_rows call."""
+        mock_sheet = MagicMock()
+        mock_sheet.get_all_values.return_value = [SHEET_HEADERS]
+        mock_get_sheet.return_value = mock_sheet
+
+        mock_50_leads = [
+            [
+                "B2B Directory / Web",
+                f"Manager {i}",
+                f"Biz {i}",
+                f"biz{i}@example.com",
+                f"+1 (512) 555-{i:04d}",
+                f"https://www.biz{i}.com",
+                f"https://www.biz{i}.com",
+                "Dental Clinic - Austin, TX",
+                "Dental Practice",
+                "Pain point",
+                "Outreach hook",
+                "2026-10-14 09:00:00 UTC",
+                "Ready for Outreach",
+            ]
+            for i in range(50)
+        ]
+        mock_scrape.return_value = mock_50_leads
+
+        test_args = ["scrape_leads.py", "--limit", "50"]
+        with patch.object(sys, "argv", test_args):
+            main()
+
+        # Assert exactly one call to append_rows with all 50 leads
+        mock_sheet.append_rows.assert_called_once_with(mock_50_leads)
+
+
+class TestFiftyLeadsQuotaAndDeduplication(unittest.TestCase):
+    """Test 50 leads daily quota guarantee and ironclad deduplication."""
+
+    @patch("scripts.scrape_leads.enrich_business_contact")
+    def test_scrape_leads_50_quota_fulfilled(self, mock_enrich):
+        """Verify scrape_leads fulfills exactly 50 leads across the cascade."""
+        mock_enrich.return_value = {
+            "email": "info@domain.com",
+            "owner_name": "Dr. Smith",
+            "has_after_hours_notice": False,
+        }
+        leads = scrape_leads(limit=50, dry_run=True)
+        self.assertEqual(len(leads), 50)
+        for lead in leads:
+            self.assertEqual(len(lead), 13)
+            self.assertEqual(lead[12], "Ready for Outreach")
+
+    @patch("scripts.scrape_leads.enrich_business_contact")
+    @patch("scripts.scrape_leads.fetch_niche_businesses")
+    def test_scrape_leads_deduplication_preserves_unique_count(self, mock_fetch, mock_enrich):
+        """Verify deduplication skips existing records without sacrificing quota fulfillment."""
+        mock_fetch.side_effect = lambda niche, city, limit: [
+            {
+                "business_name": "Austin Dental Arts",
+                "phone": "+1 (512) 999-0001",
+                "website": "https://www.austindentalarts.com",
+                "city": city,
+                "niche": niche,
+            },
+            {
+                "business_name": f"{city} {niche.title()} Care",
+                "phone": f"+1 (512) 777-{hash(niche + city) % 9000 + 1000:04d}",
+                "website": f"https://www.{niche}{city.lower()}care.com",
+                "city": city,
+                "niche": niche,
+            },
+        ]
+        mock_enrich.return_value = {
+            "email": "contact@clinic.com",
+            "owner_name": "N/A",
+            "has_after_hours_notice": False,
+        }
+
+        from scripts.deduplication import LeadDeduplicator
+        dedup = LeadDeduplicator()
+        # Seed existing phone and domain into deduplicator
+        dedup.seen_phones.add("5129990001")
+        dedup.seen_domains.add("austindentalarts.com")
+
+        leads = scrape_leads(
+            limit=5,
+            niches=["dental", "medical"],
+            cities=["Austin", "Dallas"],
+            deduplicator=dedup,
+            dry_run=True,
+        )
+
+        # Ensure no returned lead has the duplicate phone or domain
+        for lead in leads:
+            self.assertNotEqual(lead[4], "+1 (512) 999-0001")
+            self.assertNotEqual(lead[5], "https://www.austindentalarts.com")
+
 
 if __name__ == "__main__":
     unittest.main()

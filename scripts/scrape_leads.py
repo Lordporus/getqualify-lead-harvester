@@ -27,11 +27,37 @@ if REPO_ROOT not in sys.path:
 import requests
 
 try:
-    from scripts.b2b_discovery import fetch_niche_businesses, normalize_phone
+    from scripts.agent_reach_adapter import fetch_agent_reach_intent_leads
+    from scripts.b2b_discovery import (
+        DEFAULT_METRO_CITIES,
+        DEFAULT_NICHES,
+        fetch_niche_businesses,
+        harvest_target_leads,
+        normalize_phone,
+    )
+    from scripts.deduplication import (
+        LeadDeduplicator,
+        canonical_domain,
+        canonical_phone,
+        lead_signature,
+    )
     from scripts.enrichment import _normalize_domain, enrich_business_contact
     from scripts.hooks import generate_voice_ai_hook, normalize_niche
 except ImportError:
-    from b2b_discovery import fetch_niche_businesses, normalize_phone
+    from agent_reach_adapter import fetch_agent_reach_intent_leads
+    from b2b_discovery import (
+        DEFAULT_METRO_CITIES,
+        DEFAULT_NICHES,
+        fetch_niche_businesses,
+        harvest_target_leads,
+        normalize_phone,
+    )
+    from deduplication import (
+        LeadDeduplicator,
+        canonical_domain,
+        canonical_phone,
+        lead_signature,
+    )
     from enrichment import _normalize_domain, enrich_business_contact
     from hooks import generate_voice_ai_hook, normalize_niche
 
@@ -64,13 +90,23 @@ DEFAULT_NICHES = [
     "autorepair",
 ]
 
-# High-Volume US Metro Areas
+# High-Volume US Metro Areas (15-city cascade matrix)
 DEFAULT_METRO_CITIES = [
     "Austin",
     "Dallas",
     "Miami",
     "Phoenix",
     "Atlanta",
+    "Houston",
+    "Orlando",
+    "Tampa",
+    "Charlotte",
+    "Nashville",
+    "Las Vegas",
+    "Denver",
+    "San Antonio",
+    "Columbus",
+    "Indianapolis",
 ]
 
 CITY_STATE_MAP = {
@@ -80,41 +116,28 @@ CITY_STATE_MAP = {
     "Phoenix": "Phoenix, AZ",
     "Atlanta": "Atlanta, GA",
     "Houston": "Houston, TX",
-    "Chicago": "Chicago, IL",
+    "Orlando": "Orlando, FL",
+    "Tampa": "Tampa, FL",
+    "Charlotte": "Charlotte, NC",
+    "Nashville": "Nashville, TN",
+    "Las Vegas": "Las Vegas, NV",
     "Denver": "Denver, CO",
+    "San Antonio": "San Antonio, TX",
+    "Columbus": "Columbus, OH",
+    "Indianapolis": "Indianapolis, IN",
+    "Chicago": "Chicago, IL",
     "Seattle": "Seattle, WA",
 }
 
 
 def normalize_phone_key(phone: Optional[str]) -> str:
-    """Extract standard 10-digit phone key for deduplication.
-
-    Returns the last 10 digits to unify numbers with or without country code.
-    Returns empty string if invalid or N/A.
-    """
-    if not phone or not isinstance(phone, str):
-        return ""
-    cleaned = phone.strip()
-    if cleaned.lower() in ("n/a", "none", "null", "undefined"):
-        return ""
-    digits = re.sub(r"\D", "", cleaned)
-    if len(digits) >= 10:
-        return digits[-10:]
-    return digits
+    """Extract standard 10-digit phone key for deduplication."""
+    return canonical_phone(phone)
 
 
 def normalize_url_key(url: Optional[str]) -> str:
-    """Extract canonical bare domain from URL for deduplication.
-
-    Normalizes 'https://www.example.com/about' -> 'example.com'.
-    """
-    if not url or not isinstance(url, str):
-        return ""
-    cleaned = url.strip()
-    if cleaned.lower() in ("n/a", "none", "null", "undefined"):
-        return ""
-    domain = _normalize_domain(cleaned)
-    return domain.lower()
+    """Extract canonical bare domain from URL for deduplication."""
+    return canonical_domain(url)
 
 
 def build_lead_row(
@@ -179,63 +202,32 @@ def build_lead_row(
 
 def extract_existing_keys(existing_records: list[list[str]]) -> tuple[set[str], set[str]]:
     """Extracts existing phone numbers and website domains from Google Sheet rows for deduplication."""
-    existing_phones: set[str] = set()
-    existing_websites: set[str] = set()
-
-    if not existing_records or len(existing_records) <= 1:
-        return existing_phones, existing_websites
-
-    header_row = [str(h).strip().lower() for h in existing_records[0]]
-
-    # Detect phone column index
-    phone_idx = None
-    for idx, h in enumerate(header_row):
-        if "phone" in h:
-            phone_idx = idx
-            break
-    if phone_idx is None:
-        phone_idx = 4  # Default Col 5 (0-indexed: 4)
-
-    # Detect website column indices
-    website_indices: list[int] = []
-    for idx, h in enumerate(header_row):
-        if "website" in h or "post / source" in h or "url" in h:
-            website_indices.append(idx)
-    if not website_indices:
-        website_indices = [5, 6]  # Default Col 6, Col 7
-
-    for row in existing_records[1:]:
-        if len(row) > phone_idx and row[phone_idx]:
-            p_key = normalize_phone_key(row[phone_idx])
-            if p_key:
-                existing_phones.add(p_key)
-
-        for w_idx in website_indices:
-            if len(row) > w_idx and row[w_idx]:
-                w_key = normalize_url_key(row[w_idx])
-                if w_key:
-                    existing_websites.add(w_key)
-
-    return existing_phones, existing_websites
+    dedup = LeadDeduplicator()
+    dedup.load_existing_records(existing_records)
+    return dedup.seen_phones, dedup.seen_domains
 
 
 def scrape_leads(
-    limit: int = 15,
+    limit: int = 50,
     niches: Optional[list[str]] = None,
     cities: Optional[list[str]] = None,
     existing_phones: Optional[set[str]] = None,
     existing_websites: Optional[set[str]] = None,
+    deduplicator: Optional[LeadDeduplicator] = None,
     dry_run: bool = False,
+    enable_agent_reach: Optional[bool] = None,
 ) -> list[list[str]]:
     """Discovers, enriches, and formats B2B Voice AI leads across niches and cities.
 
     Args:
-        limit: Total number of fresh leads to harvest.
+        limit: Total number of fresh leads to harvest (default: 50).
         niches: List of target business niches. Defaults to DEFAULT_NICHES.
         cities: List of target metro cities. Defaults to DEFAULT_METRO_CITIES.
         existing_phones: Set of existing phone keys to skip (from Google Sheet).
         existing_websites: Set of existing website keys to skip (from Google Sheet).
+        deduplicator: Dedicated LeadDeduplicator instance for multi-key checking.
         dry_run: Flag indicating local dry-run execution.
+        enable_agent_reach: Whether to fetch intent leads via Agent-Reach (defaults to True in prod, False in dry_run).
 
     Returns:
         List of 13-column lead rows ready for Google Sheet outreach.
@@ -243,10 +235,51 @@ def scrape_leads(
     target_niches = niches or DEFAULT_NICHES
     target_cities = cities or DEFAULT_METRO_CITIES
 
-    seen_phones: set[str] = set(existing_phones or set())
-    seen_websites: set[str] = set(existing_websites or set())
+    dedup = deduplicator or LeadDeduplicator()
+    if existing_phones:
+        dedup.seen_phones.update(existing_phones)
+    if existing_websites:
+        dedup.seen_domains.update(existing_websites)
 
     harvested_leads: list[list[str]] = []
+
+    # Optional: fetch high-intent post/social leads via Agent-Reach adapter
+    should_run_agent_reach = (
+        enable_agent_reach if enable_agent_reach is not None else (not dry_run)
+    )
+    if should_run_agent_reach:
+        try:
+            intent_target = min(10, max(2, limit // 5)) if limit >= 5 else 0
+            if intent_target > 0:
+                agent_reach_candidates = fetch_agent_reach_intent_leads(limit=intent_target)
+                for cand in agent_reach_candidates:
+                    if len(harvested_leads) >= limit:
+                        break
+                    if dedup.is_duplicate(cand):
+                        continue
+
+                    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    c_niche = (cand.get("niche") or "Voice AI").title()
+                    c_city = cand.get("city") or "Target Market"
+                    intent_row = [
+                        cand.get("platform") or "Agent-Reach / Web",
+                        cand.get("author") or "Practice / Business Manager",
+                        cand.get("business_name") or "Local Business",
+                        cand.get("email") or "N/A",
+                        cand.get("phone") or "N/A",
+                        cand.get("website") or "N/A",
+                        cand.get("source_url") or cand.get("website") or "N/A",
+                        f"{c_niche} - {c_city}",
+                        cand.get("lead_intent") or "Voice AI Inbound & Scheduling Intent",
+                        cand.get("pain_point") or "High inbound inquiry volume with after-hours missed opportunities.",
+                        cand.get("recommended_hook") or "Pitch 24/7 AI Voice receptionist to convert missed customer inquiries.",
+                        now_str,
+                        "Ready for Outreach",
+                    ]
+                    dedup.register_lead(cand)
+                    harvested_leads.append(intent_row)
+        except Exception as exc:
+            logger.debug("Agent-Reach intent harvest skipped/failed: %s", exc)
 
     # Build rotating (niche, city) execution schedule
     rotation_pairs: list[tuple[str, str]] = []
@@ -268,7 +301,7 @@ def scrape_leads(
     )
     niche_counts: dict[str, int] = {n: 0 for n in target_niches}
 
-    for pass_idx in (1, 2):
+    for pass_idx in (1, 2, 3, 4):
         if len(harvested_leads) >= limit:
             break
 
@@ -304,16 +337,18 @@ def scrape_leads(
                 phone = cand.get("phone", "")
                 website = cand.get("website", "")
 
-                p_key = normalize_phone_key(phone)
-                w_key = normalize_url_key(website)
+                lead_dict = {
+                    "business_name": biz_name,
+                    "phone": phone,
+                    "website": website,
+                    "city": city,
+                    "niche": niche,
+                    "url": website,
+                }
 
-                # Deduplication checks
-                if p_key and p_key in seen_phones:
-                    logger.debug("Skipping duplicate phone: %s (%s)", phone, biz_name)
-                    continue
-
-                if w_key and w_key in seen_websites:
-                    logger.debug("Skipping duplicate website: %s (%s)", website, biz_name)
+                # Ironclad multi-key deduplication check
+                if dedup.is_duplicate(lead_dict):
+                    logger.debug("Skipping duplicate lead: %s (%s)", biz_name, phone)
                     continue
 
                 # Enrich contact details (email, owner name, after-hours notice)
@@ -332,14 +367,11 @@ def scrape_leads(
                     city=city,
                 )
 
-                # Mark as seen
-                if p_key:
-                    seen_phones.add(p_key)
-                if w_key:
-                    seen_websites.add(w_key)
+                # Register lead in deduplicator
+                dedup.register_lead(lead_dict)
 
                 harvested_leads.append(lead_row)
-                niche_counts[niche] += 1
+                niche_counts[niche] = niche_counts.get(niche, 0) + 1
 
                 logger.info(
                     "[%d/%d] Harvested: %s (%s) | Phone: %s | Email: %s",
@@ -432,8 +464,8 @@ def main():
     parser.add_argument(
         "--limit",
         type=int,
-        default=15,
-        help="Total number of fresh leads to harvest (default: 15).",
+        default=50,
+        help="Total number of fresh leads to harvest (default: 50).",
     )
     parser.add_argument(
         "--niches",
@@ -483,12 +515,12 @@ def main():
         print("=== Starting Voice AI Lead Harvester ===", flush=True)
         sheet = get_sheet()
         existing_records = sheet.get_all_values()
+        deduplicator = LeadDeduplicator()
 
         # Check and initialize headers
         if not existing_records:
             print("Sheet is empty. Adding outreach-ready headers...", flush=True)
             sheet.append_row(SHEET_HEADERS)
-            existing_phones, existing_websites = set(), set()
         else:
             first_row = existing_records[0]
             if len(first_row) < len(SHEET_HEADERS) or first_row[0] != SHEET_HEADERS[0]:
@@ -499,9 +531,10 @@ def main():
                 for col_idx, header_val in enumerate(SHEET_HEADERS, start=1):
                     sheet.update_cell(1, col_idx, header_val)
 
-            existing_phones, existing_websites = extract_existing_keys(existing_records)
+            deduplicator.load_existing_records(existing_records)
             print(
-                f"Indexed existing records: {len(existing_phones)} phones, {len(existing_websites)} websites.",
+                f"Indexed existing records: {len(deduplicator.seen_phones)} phones, "
+                f"{len(deduplicator.seen_domains)} websites, {len(deduplicator.seen_signatures)} signatures.",
                 flush=True,
             )
 
@@ -510,12 +543,12 @@ def main():
             limit=args.limit,
             niches=args.niches,
             cities=args.cities,
-            existing_phones=existing_phones,
-            existing_websites=existing_websites,
+            deduplicator=deduplicator,
             dry_run=False,
         )
 
         if leads:
+            print(f"Syncing {len(leads)} fresh leads to Google Sheet in single batch...", flush=True)
             sheet.append_rows(leads)
             print(
                 f"Successfully added {len(leads)} fresh, outreach-ready leads to Google Sheets!",
