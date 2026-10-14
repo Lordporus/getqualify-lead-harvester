@@ -2,42 +2,16 @@
 
 Automated, outreach-ready lead generation pipeline designed specifically for **B2B Voice AI Agencies & Phone Automation Platforms**.
 
+<p align="center">
+  <img src="assets/voice_ai_pipeline_architecture.jpg" alt="B2B Voice AI Lead Harvester Architecture & Pipeline Flow" width="100%" />
+</p>
+
 The harvester discovers high-call-volume local businesses, crawls their websites for verified contact details and key decision-makers, crafts personalized Voice AI pitch angles, and synchronizes deduplicated lead records directly into **Google Sheets**.
 
 ---
 
-## 🏗️ Architecture & Pipeline Flow
-
-The engine operates across four modular stages:
-
-```
-┌─────────────────────────────────┐
-│ 1. Local Business Discovery     │ Queries OpenStreetMap / Overpass API for verified local
-│    (scripts/b2b_discovery.py)   │ businesses with direct phone numbers and websites across target metros.
-└────────────────┬────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────┐
-│ 2. Website & Contact Crawler    │ Crawls business homepages, /contact, /about, and /team pages
-│    (scripts/enrichment.py)      │ to extract verified business emails, owner/practitioner names,
-└────────────────┬────────────────┘ and emergency/after-hours notice indicators.
-                 │
-                 ▼
-┌─────────────────────────────────┐
-│ 3. Voice AI Pitch Hook Engine   │ Generates industry-specific operational pain points and personalized
-│    (scripts/hooks.py)           │ cold outreach hooks addressing after-hours receptionist loss,
-└────────────────┬────────────────┘ inbound call triage, and automated appointment scheduling.
-                 │
-                 ▼
-┌─────────────────────────────────┐
-│ 4. Delivery & Deduplication     │ Dual-key deduplication (10-digit phone key & canonical domain)
-│    (scripts/scrape_leads.py)    │ ensures zero duplicate rows before appending to Google Sheets.
-└─────────────────────────────────┘
-```
-
----
-
 ## 🎯 Target High-Call Niches & Metro Cities
+
 
 The harvester targets businesses where missed phone calls directly equal lost revenue:
 
