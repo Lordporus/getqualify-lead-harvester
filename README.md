@@ -110,7 +110,7 @@ cd getqualify-lead-harvester
 
 # Install dependencies
 pip install -r requirements.txt
-pip install git+https://github.com/Panniantong/agent-reach.git || true
+pip install git+https://github.com/Panniantong/agent-reach.git@94f06c1969dfc1834001269d79d3ad0972d9dee6 || true
 ```
 
 ### 2. Dry-Run Mode (No Google Cloud Credentials Required)
