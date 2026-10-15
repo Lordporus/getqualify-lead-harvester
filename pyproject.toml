@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "getqualify-lead-harvester"
+version = "1.1.0"
+description = "Outreach-ready B2B Voice AI Lead Harvester with deep website crawling, DNS MX validation, and Google Sheets sync."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Lordporus", email = "purushottam21028@gmail.com" }
+]
+keywords = [
+    "lead-generation",
+    "b2b-leads",
+    "voice-ai",
+    "cold-outreach",
+    "lead-harvester",
+    "google-sheets",
+    "automation"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Communications :: Telephony",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search"
+]
+dependencies = [
+    "gspread>=6.0.0",
+    "google-auth>=2.0.0",
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "bandit>=1.7.5",
+    "ruff>=0.4.0",
+    "pip-audit>=2.7.0"
+]
+
+[project.scripts]
+harvest-leads = "scripts.scrape_leads:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501", "E402"]

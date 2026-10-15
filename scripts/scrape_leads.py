@@ -9,22 +9,18 @@ from __future__ import annotations
 
 import argparse
 import base64
-from datetime import datetime, timezone
 import json
 import logging
 import os
-import re
 import sys
 import traceback
-import urllib.parse
-from typing import Any, List, Optional, Set, Tuple
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 # Ensure repository root is on sys.path for direct script execution
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
-
-import requests
 
 try:
     from scripts.agent_reach_adapter import fetch_agent_reach_intent_leads
@@ -32,34 +28,28 @@ try:
         DEFAULT_METRO_CITIES,
         DEFAULT_NICHES,
         fetch_niche_businesses,
-        harvest_target_leads,
-        normalize_phone,
     )
     from scripts.deduplication import (
         LeadDeduplicator,
         canonical_domain,
         canonical_phone,
-        lead_signature,
     )
-    from scripts.enrichment import _normalize_domain, enrich_business_contact
-    from scripts.hooks import generate_voice_ai_hook, normalize_niche
+    from scripts.enrichment import enrich_business_contact
+    from scripts.hooks import generate_voice_ai_hook
 except ImportError:
     from agent_reach_adapter import fetch_agent_reach_intent_leads
     from b2b_discovery import (
         DEFAULT_METRO_CITIES,
         DEFAULT_NICHES,
         fetch_niche_businesses,
-        harvest_target_leads,
-        normalize_phone,
     )
     from deduplication import (
         LeadDeduplicator,
         canonical_domain,
         canonical_phone,
-        lead_signature,
     )
-    from enrichment import _normalize_domain, enrich_business_contact
-    from hooks import generate_voice_ai_hook, normalize_niche
+    from enrichment import enrich_business_contact
+    from hooks import generate_voice_ai_hook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)

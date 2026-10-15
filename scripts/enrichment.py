@@ -594,21 +594,22 @@ def enrich_business_contact(website_url: str | None, timeout: int = 6) -> dict[s
     owner_name = "N/A"
     has_after_hours = False
 
-    def fetch_page(url_to_fetch: str) -> str | None:
+    def fetch_page(url_to_fetch: str, page_timeout: float | None = None) -> str | None:
+        eff_timeout = page_timeout or timeout
         try:
-            resp = session.get(url_to_fetch, headers=headers, timeout=timeout, allow_redirects=True)
+            resp = session.get(url_to_fetch, headers=headers, timeout=eff_timeout, allow_redirects=True)
             if resp.status_code == 200 and resp.text:
                 return resp.text
         except requests.exceptions.SSLError:
             # Try once without SSL verification if certificate verification failed
             try:
                 resp = session.get(
-                    url_to_fetch, headers=headers, timeout=timeout, verify=False, allow_redirects=True
+                    url_to_fetch, headers=headers, timeout=eff_timeout, verify=False, allow_redirects=True
                 )
                 if resp.status_code == 200 and resp.text:
                     return resp.text
-            except Exception:
-                pass
+            except Exception as ssl_exc:
+                logger.debug("SSL fallback failed for %s: %s", url_to_fetch, ssl_exc)
         except Exception as exc:
             logger.debug("Error fetching %s: %s", url_to_fetch, exc)
         return None
@@ -628,7 +629,7 @@ def enrich_business_contact(website_url: str | None, timeout: int = 6) -> dict[s
         if subpage_urls:
             subpage_timeout = min(timeout, 4)
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(subpage_urls))) as executor:
-                future_to_url = {executor.submit(fetch_page, u): u for u in subpage_urls}
+                future_to_url = {executor.submit(fetch_page, u, subpage_timeout): u for u in subpage_urls}
                 for future in concurrent.futures.as_completed(future_to_url):
                     try:
                         sub_html = future.result()
