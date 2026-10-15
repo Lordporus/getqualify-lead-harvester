@@ -8,6 +8,7 @@ Eliminates 'N/A' fields for downstream Voice AI sales generation.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import re
@@ -28,6 +29,33 @@ CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
+
+# Common keywords for identifying relevant contact/team subpages
+CONTACT_PATH_KEYWORDS = (
+    "contact",
+    "about",
+    "team",
+    "staff",
+    "doctor",
+    "dentist",
+    "attorney",
+    "provider",
+    "meet",
+    "location",
+    "office",
+)
+
+# Standard subpage fallback candidates
+DEFAULT_SUBPAGE_FALLBACKS = [
+    "/contact-us",
+    "/contact",
+    "/about-us",
+    "/about",
+    "/our-team",
+    "/team",
+    "/staff",
+    "/doctors",
+]
 
 # Common image and media extensions to filter out of email matches
 IMAGE_EXTENSIONS = (
@@ -106,6 +134,11 @@ def clean_email(email_str: str | None) -> str | None:
     - Platform trackers and CMS placeholders (e.g. wixpress.com, sentry.io)
     - Malformed addresses
 
+    Unmasks obfuscated formats:
+    - "info [at] domain [dot] com" -> "info@domain.com"
+    - "contact (at) domain.com" -> "contact@domain.com"
+    - "help at domain dot com" -> "help@domain.com"
+
     Returns lowercase valid email address or None.
     """
     if not email_str or not isinstance(email_str, str):
@@ -116,6 +149,10 @@ def clean_email(email_str: str | None) -> str | None:
         candidate = candidate[7:]
     if "?" in candidate:
         candidate = candidate.split("?", 1)[0]
+
+    # Normalize obfuscated patterns
+    candidate = re.sub(r"\s*\[at\]\s*|\s*\(at\)\s*|\s+at\s+", "@", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\s*\[dot\]\s*|\s*\(dot\)\s*|\s+dot\s+", ".", candidate, flags=re.IGNORECASE)
 
     candidate = candidate.strip().strip("'\"<>.,;:()[]{}")
     if not candidate or "@" not in candidate:
@@ -154,7 +191,7 @@ def clean_email(email_str: str | None) -> str | None:
 
     # Standard RFC-like email regex check
     email_pattern = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
-    if not email_pattern.match(candidate):
+    if not email_pattern.match(candidate_lower):
         return None
 
     return candidate_lower
@@ -176,6 +213,77 @@ def _normalize_domain(domain_or_url: str) -> str:
         return host
     except Exception:
         return ""
+
+
+def discover_contact_subpage_urls(html: str, base_url: str, max_subpages: int = 5) -> list[str]:
+    """Inspects homepage HTML links and appends standard fallbacks to discover up to max_subpages."""
+    if not base_url:
+        return []
+
+    clean_base = base_url.strip()
+    if not clean_base.startswith(("http://", "https://")):
+        clean_base = "https://" + clean_base
+
+    base_domain = _normalize_domain(clean_base)
+    discovered: list[str] = []
+    seen_urls: set[str] = {clean_base.rstrip("/").lower()}
+
+    # 1. Parse anchors from HTML
+    if html and isinstance(html, str):
+        if BeautifulSoup is not None:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"].strip()
+                    text = a.get_text(separator=" ", strip=True).lower()
+                    if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                        continue
+
+                    full_url = urllib.parse.urljoin(clean_base, href)
+                    sub_domain = _normalize_domain(full_url)
+                    # Stay within same root domain
+                    if sub_domain != base_domain and not sub_domain.endswith("." + base_domain):
+                        continue
+
+                    href_lower = href.lower()
+                    is_match = any(kw in href_lower for kw in CONTACT_PATH_KEYWORDS) or any(
+                        kw in text for kw in ("contact", "about", "team", "staff", "doctor", "dentist", "attorney", "meet the")
+                    )
+
+                    norm_url = full_url.split("?")[0].split("#")[0].rstrip("/").lower()
+                    if is_match and norm_url not in seen_urls:
+                        seen_urls.add(norm_url)
+                        discovered.append(full_url)
+                        if len(discovered) >= max_subpages:
+                            break
+            except Exception as exc:
+                logger.debug("Error parsing subpage links with soup: %s", exc)
+        else:
+            for href in re.findall(r'href=["\']([^"\']+)["\']', html, re.IGNORECASE):
+                href_lower = href.lower()
+                if any(kw in href_lower for kw in CONTACT_PATH_KEYWORDS):
+                    full_url = urllib.parse.urljoin(clean_base, href)
+                    sub_domain = _normalize_domain(full_url)
+                    if sub_domain == base_domain:
+                        norm_url = full_url.split("?")[0].split("#")[0].rstrip("/").lower()
+                        if norm_url not in seen_urls:
+                            seen_urls.add(norm_url)
+                            discovered.append(full_url)
+                            if len(discovered) >= max_subpages:
+                                break
+
+    # 2. Append standard fallbacks if under quota
+    if len(discovered) < max_subpages:
+        for fallback_path in DEFAULT_SUBPAGE_FALLBACKS:
+            fallback_url = urllib.parse.urljoin(clean_base, fallback_path)
+            norm_url = fallback_url.split("?")[0].split("#")[0].rstrip("/").lower()
+            if norm_url not in seen_urls:
+                seen_urls.add(norm_url)
+                discovered.append(fallback_url)
+                if len(discovered) >= max_subpages:
+                    break
+
+    return discovered[:max_subpages]
 
 
 def extract_emails_from_html(html: str, domain: str = "") -> list[str]:
@@ -211,10 +319,19 @@ def extract_emails_from_html(html: str, domain: str = "") -> list[str]:
                 if cleaned:
                     found_emails.add(cleaned)
 
-
-    # 2. Run regex pattern over full HTML text
+    # 2. Run regex pattern over full HTML text (standard format)
     raw_pattern = re.compile(r"\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\b")
     for match in raw_pattern.findall(html):
+        cleaned = clean_email(match)
+        if cleaned:
+            found_emails.add(cleaned)
+
+    # 3. Search for obfuscated text patterns (e.g. name [at] domain [dot] com)
+    obf_pattern = re.compile(
+        r"\b[a-zA-Z0-9_.+-]+(?:\s*\[at\]\s*|\s*\(at\)\s*|\s+at\s+)[a-zA-Z0-9-]+(?:\s*\[dot\]\s*|\s*\(dot\)\s*|\s+dot\s+|\.)[a-zA-Z0-9-.]+\b",
+        re.IGNORECASE,
+    )
+    for match in obf_pattern.findall(html):
         cleaned = clean_email(match)
         if cleaned:
             found_emails.add(cleaned)
@@ -429,18 +546,27 @@ def enrich_business_contact(website_url: str | None, timeout: int = 6) -> dict[s
         if _check_after_hours(home_html):
             has_after_hours = True
 
-    # Step 2: If email or owner missing, attempt /contact page
+    # Step 2: Multi-subpage crawling (up to 5 subpages in parallel)
     if not all_emails or owner_name == "N/A":
-        contact_url = urllib.parse.urljoin(cleaned_url, "/contact")
-        if contact_url != cleaned_url:
-            contact_html = fetch_page(contact_url)
-            if contact_html:
-                contact_emails = extract_emails_from_html(contact_html, domain=domain)
-                all_emails.extend([e for e in contact_emails if e not in all_emails])
-                if owner_name == "N/A":
-                    owner_name = extract_owner_name_from_html(contact_html)
-                if _check_after_hours(contact_html):
-                    has_after_hours = True
+        subpage_urls = discover_contact_subpage_urls(home_html or "", cleaned_url, max_subpages=5)
+        if subpage_urls:
+            subpage_timeout = min(timeout, 4)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(subpage_urls))) as executor:
+                future_to_url = {executor.submit(fetch_page, u): u for u in subpage_urls}
+                for future in concurrent.futures.as_completed(future_to_url):
+                    try:
+                        sub_html = future.result()
+                        if sub_html:
+                            sub_emails = extract_emails_from_html(sub_html, domain=domain)
+                            all_emails.extend([e for e in sub_emails if e not in all_emails])
+                            if owner_name == "N/A":
+                                cand_owner = extract_owner_name_from_html(sub_html)
+                                if cand_owner != "N/A":
+                                    owner_name = cand_owner
+                            if not has_after_hours and _check_after_hours(sub_html):
+                                has_after_hours = True
+                    except Exception as err:
+                        logger.debug("Subpage crawl worker error: %s", err)
 
     # Final prioritization if multiple emails collected
     final_email = "N/A"

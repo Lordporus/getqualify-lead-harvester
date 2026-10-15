@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from scripts.enrichment import (
     clean_email,
+    discover_contact_subpage_urls,
     extract_emails_from_html,
     extract_owner_name_from_html,
     enrich_business_contact,
@@ -18,7 +19,7 @@ from scripts.enrichment import (
 class TestEmailAndContactEnrichment(unittest.TestCase):
     """Test suite for website email and owner enrichment engine."""
 
-    # --- Tests for clean_email ---
+    # --- Tests for clean_email and obfuscation ---
 
     def test_clean_email_valid(self):
         """Test valid standard emails and normalizations."""
@@ -30,6 +31,48 @@ class TestEmailAndContactEnrichment(unittest.TestCase):
             "appointments@austindental.com",
         )
         self.assertEqual(clean_email("  support@austindental.com  "), "support@austindental.com")
+
+    def test_clean_email_obfuscated(self):
+        """Test unmasking obfuscated email syntax."""
+        self.assertEqual(clean_email("info [at] austindental [dot] com"), "info@austindental.com")
+        self.assertEqual(clean_email("contact (at) austindental.com"), "contact@austindental.com")
+        self.assertEqual(clean_email("office [at] austindental.com"), "office@austindental.com")
+        self.assertEqual(clean_email("help at austindental dot com"), "help@austindental.com")
+
+    def test_discover_contact_subpage_urls(self):
+        """Test finding up to 5 relevant subpages from homepage HTML."""
+        html = """
+        <html>
+            <body>
+                <a href="/about-us">About Our Practice</a>
+                <a href="/our-team">Meet the Doctors</a>
+                <a href="https://www.austindental.com/contact-us">Contact Us</a>
+                <a href="/pricing">Pricing</a>
+                <a href="https://facebook.com/austindental">Facebook</a>
+                <a href="/staff">Our Dental Staff</a>
+            </body>
+        </html>
+        """
+        urls = discover_contact_subpage_urls(html, "https://www.austindental.com", max_subpages=5)
+        self.assertLessEqual(len(urls), 5)
+        self.assertIn("https://www.austindental.com/contact-us", urls)
+        self.assertIn("https://www.austindental.com/about-us", urls)
+        self.assertIn("https://www.austindental.com/our-team", urls)
+        self.assertNotIn("https://facebook.com/austindental", urls)
+
+    def test_extract_obfuscated_emails_from_html(self):
+        """Test extracting obfuscated emails from HTML body."""
+        html = """
+        <html>
+            <body>
+                <p>Send appointment requests to: booking [at] austindental [dot] com</p>
+                <p>Or reach the doctor directly at drsmith (at) austindental.com</p>
+            </body>
+        </html>
+        """
+        emails = extract_emails_from_html(html, "austindental.com")
+        self.assertIn("booking@austindental.com", emails)
+        self.assertIn("drsmith@austindental.com", emails)
 
     def test_clean_email_rejects_image_assets(self):
         """Test rejection of image file patterns resembling emails."""
@@ -246,6 +289,45 @@ class TestEmailAndContactEnrichment(unittest.TestCase):
         self.assertEqual(result["email"], "info@austindental.com")
         self.assertEqual(result["owner_name"], "N/A")
         self.assertFalse(result["has_after_hours_notice"])
+
+    @patch("scripts.enrichment.requests.Session")
+    def test_enrich_business_contact_multi_subpage_parallel(self, mock_session_cls):
+        """Test aggressive 5-subpage discovery where email is on /our-team and owner is on /about-us."""
+        mock_session = MagicMock()
+        mock_session_cls.return_value = mock_session
+
+        homepage_html = """
+        <html>
+            <body>
+                <h1>Welcome to Premier Dental</h1>
+                <a href="/about-us">About</a>
+                <a href="/our-team">Our Doctors</a>
+            </body>
+        </html>
+        """
+        about_html = """
+        <html><body><p>Founder & Owner: Dr. Marcus Vance</p></body></html>
+        """
+        team_html = """
+        <html><body><p>Contact the clinical team at: team@premierdental.com</p></body></html>
+        """
+
+        def mock_get(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            if "about" in url:
+                resp.text = about_html
+            elif "team" in url:
+                resp.text = team_html
+            else:
+                resp.text = homepage_html
+            return resp
+
+        mock_session.get.side_effect = mock_get
+
+        result = enrich_business_contact("https://www.premierdental.com", timeout=6)
+        self.assertEqual(result["email"], "team@premierdental.com")
+        self.assertIn("Marcus Vance", result["owner_name"])
 
     @patch("scripts.enrichment.requests.Session")
     def test_enrich_business_contact_network_resilience(self, mock_session_cls):
