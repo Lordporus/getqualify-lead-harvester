@@ -1,0 +1,40 @@
+name: CI Tests & Quality
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run Unit Tests & Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install git+https://github.com/Panniantong/agent-reach.git@94f06c1969dfc1834001269d79d3ad0972d9dee6 || true
+          pip install ruff bandit
+
+      - name: Run Test Suite
+        run: |
+          python -m unittest discover tests
+
+      - name: Run Security & Style Checks
+        run: |
+          ruff check scripts/
+          bandit -r scripts/
