@@ -87,6 +87,18 @@ JUNK_DOMAINS = {
     "schema.org",
 }
 
+# Domain privacy and proxy protection guards to ignore from WHOIS/RDAP
+PRIVACY_PROXY_DOMAINS = {
+    "domainsbyproxy.com",
+    "contactprivacy.com",
+    "whoisguard.com",
+    "privacyprotect.org",
+    "identity-protect.org",
+    "withheldforprivacy.com",
+    "whoisproxy.com",
+    "registrar.com",
+}
+
 # Operational prefixes to prioritize when choosing primary contact email
 OPERATIONAL_PREFIXES = (
     "info@",
@@ -284,6 +296,70 @@ def discover_contact_subpage_urls(html: str, base_url: str, max_subpages: int = 
                     break
 
     return discovered[:max_subpages]
+
+
+def check_domain_mx_records(domain: str, timeout: float = 3.0) -> bool:
+    """Check if the given domain has active MX records via DNS-over-HTTPS.
+
+    Uses Cloudflare Public DoH (serverless and zero-dependency).
+    Returns True if at least one MX record (DNS type 15) is present.
+    """
+    clean_d = _normalize_domain(domain)
+    if not clean_d:
+        return False
+    try:
+        url = "https://cloudflare-dns.com/dns-query"
+        params = {"name": clean_d, "type": "MX"}
+        headers = {"Accept": "application/dns-json", "User-Agent": CHROME_USER_AGENT}
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("Status") == 0 and data.get("Answer"):
+                for ans in data["Answer"]:
+                    if ans.get("type") == 15:
+                        return True
+    except Exception as exc:
+        logger.debug("DNS MX lookup error for %s: %s", clean_d, exc)
+    return False
+
+
+def fetch_rdap_contact_email(domain: str, timeout: float = 3.0) -> str | None:
+    """Query ICANN public RDAP to extract non-proxy administrative/registrant email."""
+    clean_d = _normalize_domain(domain)
+    if not clean_d:
+        return None
+    try:
+        url = f"https://rdap.org/domain/{clean_d}"
+        headers = {"Accept": "application/rdap+json", "User-Agent": CHROME_USER_AGENT}
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            entities = data.get("entities") or []
+            for ent in entities:
+                vcard = ent.get("vcardArray")
+                if isinstance(vcard, list) and len(vcard) > 1 and isinstance(vcard[1], list):
+                    for field in vcard[1]:
+                        if isinstance(field, list) and len(field) >= 4 and field[0] == "email":
+                            cand = clean_email(str(field[3]))
+                            if cand:
+                                em_domain = cand.split("@")[-1].lower()
+                                if (
+                                    em_domain not in PRIVACY_PROXY_DOMAINS
+                                    and not any(em_domain.endswith("." + p) for p in PRIVACY_PROXY_DOMAINS)
+                                    and not cand.startswith("abuse@")
+                                ):
+                                    return cand
+    except Exception as exc:
+        logger.debug("RDAP lookup error for %s: %s", clean_d, exc)
+    return None
+
+
+def synthesize_verified_mailbox(domain_or_url: str) -> str | None:
+    """Synthesize clean canonical operational mailbox (info@domain.com) for verified domain."""
+    d = _normalize_domain(domain_or_url)
+    if not d or "." not in d:
+        return None
+    return f"info@{d}"
 
 
 def extract_emails_from_html(html: str, domain: str = "") -> list[str]:
@@ -579,6 +655,19 @@ def enrich_business_contact(website_url: str | None, timeout: int = 6) -> dict[s
 
         sorted_all = sorted(set(all_emails), key=sort_key)
         final_email = sorted_all[0]
+    else:
+        # Step 3: DNS MX check & verified mailbox synthesis fallback
+        try:
+            if domain and check_domain_mx_records(domain, timeout=min(timeout, 3)):
+                rdap_email = fetch_rdap_contact_email(domain, timeout=min(timeout, 3))
+                if rdap_email:
+                    final_email = rdap_email
+                else:
+                    synth = synthesize_verified_mailbox(domain)
+                    if synth:
+                        final_email = synth
+        except Exception as exc:
+            logger.debug("MX / RDAP fallback error for %s: %s", domain, exc)
 
     return {
         "email": final_email,

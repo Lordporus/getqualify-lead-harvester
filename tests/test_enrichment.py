@@ -9,9 +9,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from scripts.enrichment import (
     clean_email,
+    check_domain_mx_records,
     discover_contact_subpage_urls,
     extract_emails_from_html,
     extract_owner_name_from_html,
+    fetch_rdap_contact_email,
+    synthesize_verified_mailbox,
     enrich_business_contact,
 )
 
@@ -350,6 +353,92 @@ class TestEmailAndContactEnrichment(unittest.TestCase):
             self.assertEqual(result["email"], "N/A")
             self.assertEqual(result["owner_name"], "N/A")
             self.assertFalse(result["has_after_hours_notice"])
+
+    # --- Tests for DNS MX, RDAP, and Mailbox Synthesis ---
+
+    @patch("scripts.enrichment.requests.get")
+    def test_check_domain_mx_records_active(self, mock_get):
+        """Test DNS MX check returning True when mail servers are active."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "Status": 0,
+            "Answer": [
+                {"name": "austindental.com", "type": 15, "data": "10 mail.austindental.com"}
+            ],
+        }
+        mock_get.return_value = mock_resp
+
+        self.assertTrue(check_domain_mx_records("austindental.com"))
+
+    @patch("scripts.enrichment.requests.get")
+    def test_check_domain_mx_records_inactive(self, mock_get):
+        """Test DNS MX check returning False when domain has no mail servers."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"Status": 3, "Answer": []}
+        mock_get.return_value = mock_resp
+
+        self.assertFalse(check_domain_mx_records("no-email-domain-xyz.com"))
+
+    @patch("scripts.enrichment.requests.get")
+    def test_fetch_rdap_contact_email(self, mock_get):
+        """Test extracting public administrative email from RDAP response while ignoring privacy proxies."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "entities": [
+                {
+                    "roles": ["registrant"],
+                    "vcardArray": [
+                        "vcard",
+                        [
+                            ["version", {}, "text", "4.0"],
+                            ["fn", {}, "text", "Domain Admin"],
+                            ["email", {}, "text", "contact@domainsbyproxy.com"],  # Should be filtered out
+                        ],
+                    ],
+                },
+                {
+                    "roles": ["administrative"],
+                    "vcardArray": [
+                        "vcard",
+                        [
+                            ["fn", {}, "text", "Office Contact"],
+                            ["email", {}, "text", "office@austindental.com"],  # Valid email
+                        ],
+                    ],
+                },
+            ]
+        }
+        mock_get.return_value = mock_resp
+
+        email = fetch_rdap_contact_email("austindental.com")
+        self.assertEqual(email, "office@austindental.com")
+
+    def test_synthesize_verified_mailbox(self):
+        """Test synthesizing clean canonical mailbox for domain."""
+        self.assertEqual(synthesize_verified_mailbox("austindental.com"), "info@austindental.com")
+        self.assertEqual(synthesize_verified_mailbox("https://www.smilecare.org"), "info@smilecare.org")
+        self.assertIsNone(synthesize_verified_mailbox(""))
+
+    @patch("scripts.enrichment.check_domain_mx_records")
+    @patch("scripts.enrichment.fetch_rdap_contact_email")
+    @patch("scripts.enrichment.requests.Session")
+    def test_enrich_business_contact_mx_synthesis(self, mock_session_cls, mock_rdap, mock_mx):
+        """Test synthesis of info@domain when site has no emails but MX is active."""
+        mock_session = MagicMock()
+        mock_session_cls.return_value = mock_session
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = "<html><body><h1>Welcome to Apex Dental</h1><p>Call (512) 555-0100</p></body></html>"
+        mock_session.get.return_value = mock_resp
+
+        mock_mx.return_value = True
+        mock_rdap.return_value = None  # No RDAP email, falls back to synthesized mailbox
+
+        result = enrich_business_contact("https://www.apexdental.com", timeout=6)
+        self.assertEqual(result["email"], "info@apexdental.com")
 
 
 if __name__ == "__main__":
