@@ -44,6 +44,27 @@ The harvester cascades through 15 high-density, growing US markets:
 
 ---
 
+## ⚡ Deep Multi-Page Email Crawler & DNS MX Verification
+
+To overcome the common limitation of low email capture rates (~15-20%) on business landing pages, the harvester runs an aggressive, zero-cost 4-tier enrichment engine:
+
+1. **Aggressive Subpage Discovery & Parallel Crawling:**
+   - In parallel across 5 worker threads (`ThreadPoolExecutor`), scans up to 5 critical contact subpages per business: `/contact`, `/contact-us`, `/about`, `/about-us`, `/team`, `/our-team`, `/staff`, `/doctors`, and `/attorneys`.
+   - Priority-scores anchor texts and path tokens (`contact` > `about` > `team`) to fetch the highest-yield pages first.
+2. **Obfuscated Email Unmasking & Anti-Scrape Decoder:**
+   - Detects and decodes anti-spam obfuscation techniques:
+     - `contact [at] company [dot] com` -> `contact@company.com`
+     - `contact(at)company(dot)com` -> `contact@company.com`
+     - HTML entity encodings (`&#64;`, `&commat;`) and `mailto:` hyperlink targets.
+3. **Cloudflare DNS-over-HTTPS (DoH) MX Record Validation:**
+   - Queries Cloudflare's public DoH resolver (`https://cloudflare-dns.com/dns-query?name={domain}&type=MX`) with zero extra libraries or OS-dependent resolver quirks.
+   - Verifies whether the domain is configured to receive inbound emails before creating or validating any address.
+4. **Public ICANN RDAP & Verified Mailbox Synthesis:**
+   - When no on-page email exists, checks public ICANN RDAP registries (`https://rdap.org/domain/{domain}`) while filtering out registrar privacy proxies (`@domainsbyproxy.com`, `@contactprivacy.com`, `@whoisprotection.cc`).
+   - If MX records exist, synthesizes a standard clean business inbox (`info@domain.com`) guaranteed to be formatted without brackets or extraneous tags—ready for direct copy-paste into cold outreach tools (Instantly, Lemlist, Smartlead).
+
+---
+
 ## 🛡️ Ironclad Multi-Key Deduplication Engine
 
 To ensure that your Google Sheet **never receives duplicate leads at any cost**, every candidate is vetted through a 4-point deduplication engine against both existing sheet records and in-batch candidates:
