@@ -1,5 +1,16 @@
 # B2B Voice AI Lead Harvester 🚀
 
+<p align="left">
+  <a href="https://github.com/Lordporus/getqualify-lead-harvester/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Lordporus/getqualify-lead-harvester/ci.yml?branch=main&label=CI%20Tests&style=for-the-badge&logo=githubactions&logoColor=white" alt="CI Status" /></a>
+  <a href="https://github.com/Lordporus/getqualify-lead-harvester/stargazers"><img src="https://img.shields.io/github/stars/Lordporus/getqualify-lead-harvester?style=for-the-badge&logo=github&color=gold" alt="GitHub Stars" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="MIT License" /></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+" /></a>
+  <a href="https://developers.google.com/sheets/api"><img src="https://img.shields.io/badge/Google%20Sheets-Automated%20Sync-34A853?style=for-the-badge&logo=googlesheets&logoColor=white" alt="Google Sheets Sync" /></a>
+  <img src="https://img.shields.io/badge/API%20Cost-%240%20(100%25%20Free)-success?style=for-the-badge" alt="Zero Cost" />
+</p>
+
+> ⭐️ **If you find this B2B Voice AI Lead Harvester helpful, please consider giving it a star on GitHub! It helps more agency owners and developers discover this open-source tool.**
+
 Automated, outreach-ready lead generation pipeline designed specifically for **B2B Voice AI Agencies & Phone Automation Platforms**.
 
 <p align="center">
